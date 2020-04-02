@@ -25,7 +25,6 @@ class PolkitCheck(AbstractCheck.AbstractCheck):
         AbstractCheck.AbstractCheck.__init__(self, "CheckPolkitPrivs")
         self.privs = {}
         self._collect_privs()
-        self._collect_rules_whitelist()
 
     def _get_err_prefix(self):
         """error prefix label to be used for early error printing."""
@@ -47,14 +46,13 @@ class PolkitCheck(AbstractCheck.AbstractCheck):
 
                     self.privs[priv] = value
 
-    def _collect_rules_whitelist(self):
-        rules_entries = {}
+    def _collect_rules_whitelist(self, package_name):
+        rules_entries = []
         for filename in POLKIT_RULES_WHITELIST:
             if not os.path.exists(filename):
                 continue
             parser = Whitelisting.WhitelistParser(filename)
-            res = parser.parse()
-            rules_entries.update(res)
+            rules_entries += parser.parse(package_name)
 
         self.m_rules_checker = Whitelisting.WhitelistChecker(
             rules_entries,
@@ -185,9 +183,10 @@ class PolkitCheck(AbstractCheck.AbstractCheck):
         self.m_rules_checker.check(pkg)
 
     def check(self, pkg):
-
         if pkg.isSource():
             return
+
+        self._collect_rules_whitelist(pkg.name)
 
         self.check_perm_files(pkg)
         self.check_actions(pkg)

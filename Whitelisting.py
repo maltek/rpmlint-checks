@@ -95,6 +95,11 @@ class AuditEntry(object):
         digest" case which means not to check the file digest at all."""
         return digest == 'skip:<none>'
 
+    def coversAllFiles(self, file_paths):
+        """Returns a boolean indicating whether all files from the set
+        'file_paths' are covered by this audit."""
+        return file_paths.issubset(self.digests().keys())
+
     def compareDigests(self, pkg):
         """Compares the digests recorded in this AuditEntry against the actual
         files coming from the given rpmlint @pkg. Returns a tuple of
@@ -194,31 +199,6 @@ class AuditEntry(object):
             raise Exception("Bad whitelisting path " + path)
 
 
-class WhitelistEntry(object):
-    """This object represents a single whitelisting entry like:
-
-    "somepackage" {
-        "audits": {
-            ...
-        }
-    },
-    """
-
-    def __init__(self, package):
-        self.m_package = package
-        # a list of AuditEntry objects associated with this whitelisting entry
-        self.m_audits = []
-
-    def package(self):
-        return self.m_package
-
-    def addAudit(self, audit):
-        self.m_audits.append(audit)
-
-    def audits(self):
-        return self.m_audits
-
-
 class WhitelistParser(object):
     """This type knows how to parse the JSON whitelisting format. The format
     is documented in [1].
@@ -232,34 +212,19 @@ class WhitelistParser(object):
 
         self.m_path = wl_path
 
-    def parse(self):
-        """Parses the whitelisting file and returns a dictionary of the
-        following structure:
-
-        {
-            "path/to/file": [WhitelistEntry(), ...],
-            ...
-        }
-
-        Since a single path might be claimed by more than one package the
-        values of the dictionary are lists, to cover for this possibility.
-        """
-
-        ret = {}
+    def parse(self, package):
+        """Parses the whitelisting file for the current package and returns a list of AuditEntry objects."""
 
         try:
             with open(self.m_path, 'r') as fd:
                 data = json.load(fd)
 
-                for pkg, config in data.items():
-                    entry = self._parseWhitelistEntry(pkg, config)
-                    if not entry:
-                        # soft error, continue parsing
-                        continue
-                    for a in entry.audits():
-                        for path in a.digests():
-                            entries = ret.setdefault(path, [])
-                            entries.append(entry)
+                try:
+                    config = data[package]
+                except KeyError:
+                    return []
+
+                return self._parseWhitelistEntry(package, config)
         except Exception as e:
             _, _, tb = sys.exc_info()
             fn, ln, _, _ = traceback.extract_tb(tb)[-1]
@@ -267,16 +232,14 @@ class WhitelistParser(object):
                 fn, ln, str(e)
             ))
 
-        return ret
-
     def _parseWhitelistEntry(self, package, config):
         """Parses a single JSON whitelist entry and returns a WhitelistEntry()
         object for it. On non-critical error conditions None is returned,
         otherwise an exception is raised."""
 
-        ret = WhitelistEntry(package)
+        ret = []
 
-        audits = config.get("audits", {})
+        audits = config.get("audits")
 
         if not audits:
             raise Exception(self._getErrorPrefix() + "no 'audits' entries for package {}".format(package))
@@ -287,10 +250,9 @@ class WhitelistParser(object):
             except Exception as e:
                 raise Exception(self._getErrorPrefix() + "Failed to parse audit entries: " + str(e))
 
-            if not audit:
-                # soft error, continue parsing
-                continue
-            ret.addAudit(audit)
+            # missing audit is soft error, continue parsing
+            if audit:
+                ret.append(audit)
 
         return ret
 
@@ -301,11 +263,11 @@ class WhitelistParser(object):
 
         ret = AuditEntry(bug)
 
-        comment = data.get("comment", None)
+        comment = data.get("comment")
         if comment:
             ret.setComment(comment)
 
-        digests = data.get("digests", {})
+        digests = data.get("digests")
 
         if not digests:
             raise Exception(self._getErrorPrefix() + "no 'digests' entry for '{}'".format(bug))
@@ -364,69 +326,33 @@ class WhitelistChecker(object):
             return
 
         files = pkg.files()
-        already_tested = set()
 
-        for f in files:
-            for restricted in self.m_restricted_paths:
-                if f.startswith(restricted):
-                    break
-            else:
-                # no match
-                continue
+        restricted_files = set(f for f in files if any(f.startswith(restricted) for restricted in self.m_restricted_paths))
 
-            if f in pkg.ghostFiles():
-                printError(pkg, self.m_error_map['ghost'], f)
-                continue
+        for f in restricted_files & set(pkg.ghostFiles()):
+            printError(pkg, self.m_error_map['ghost'], f)
+            restricted_files.remove(f)
 
-            entries = self.m_whitelist_entries.get(f, [])
-            wl_match = None
-            for entry in entries:
-                if entry.package() == pkg.name:
-                    wl_match = entry
-                    break
-            else:
-                # no whitelist entry exists for this file
-                printError(pkg, self.m_error_map['unauthorized'], f)
-                continue
+        if not restricted_files:
+            return
 
-            # avoid testing the same paths multiple times thereby avoiding
-            # duplicate error messages or unnecessary re-checks of the same
-            # files.
-            # this is necessary since whitelisting entries can consist of
-            # groups of files that are all checked in one go below.
-            if f in already_tested:
-                continue
+        results = []
 
-            # for the case that there's no match of digests, remember the most
-            # recent digest verification result for diagnosis output towards
-            # the user
-            diag_results = None
+        for audit in self.m_whitelist_entries:
+            digest_matches, results = audit.compareDigests(pkg)
 
-            # check the newest (bottom) entry first it is more likely to match
-            # what we have
-            for audit in reversed(wl_match.audits()):
-                digest_matches, results = audit.compareDigests(pkg)
+            if digest_matches and audit.coversAllFiles(restricted_files):
+                break
+        else:
+            self._printVerificationResults(pkg, results, restricted_files)
 
-                if digest_matches:
-                    for r in results:
-                        already_tested.add(r.path())
-                    break
-
-                if not diag_results:
-                    diag_results = results
-            else:
-                for r in diag_results:
-                    already_tested.add(r.path())
-                # none of the digest entries matched
-                self._printVerificationResults(diag_results)
-                printError(pkg, self.m_error_map['changed'], f)
-                continue
-
-    def _printVerificationResults(self, verification_results):
+    def _printVerificationResults(self, pkg, verification_results, restricted_files):
         """For the case of changed file digests this function prints the
         encountered and expected digests and paths for diagnostic purposes."""
 
         for result in verification_results:
+            restricted_files -= {result.path()}
+
             if result.matches():
                 continue
 
@@ -434,3 +360,7 @@ class WhitelistChecker(object):
                 path=result.path(), alg=result.algorithm(),
                 expected=result.expected(), encountered=result.encountered()
             ), file=sys.stderr)
+            printError(pkg, self.m_error_map['changed'], f)
+
+        for f in restricted_files:
+            printError(pkg, self.m_error_map['unauthorized'], f)

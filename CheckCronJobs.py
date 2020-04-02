@@ -22,34 +22,6 @@ class CronCheck(AbstractCheck.AbstractCheck):
     def __init__(self):
         AbstractCheck.AbstractCheck.__init__(self, "CheckCronJobs")
 
-        for wd in WHITELIST_DIR:
-            candidate = os.path.join(wd, "cron-whitelist.json")
-            if os.path.exists(candidate):
-                whitelist_path = candidate
-                break
-        else:
-            whitelist_path = None
-
-        self.m_check_configured = whitelist_path is not None
-
-        if not self.m_check_configured:
-            return
-
-        parser = Whitelisting.WhitelistParser(whitelist_path)
-        whitelist_entries = parser.parse()
-        self.m_wl_checker = Whitelisting.WhitelistChecker(
-            whitelist_entries,
-            restricted_paths=(
-                "/etc/cron.d/", "/etc/cron.hourly/", "/etc/cron.daily/",
-                "/etc/cron.weekly/", "/etc/cron.monthly/"
-            ),
-            error_map={
-                "unauthorized": "cronjob-unauthorized-file",
-                "changed": "cronjob-changed-file",
-                "ghost": "cronjob-ghost-file"
-            }
-        )
-
     def _getPrintPrefix(self):
         """Returns a prefix for error / warning output."""
         return self.__class__.__name__ + ":"
@@ -64,12 +36,31 @@ class CronCheck(AbstractCheck.AbstractCheck):
         """This is called by rpmlint to perform the cron check on the given
         pkg."""
 
-        if not self.m_check_configured:
+        for wd in WHITELIST_DIR:
+            candidate = os.path.join(wd, "cron-whitelist.json")
+            if os.path.exists(candidate):
+                whitelist_path = candidate
+                break
+        else:
             # don't ruin the whole run if this check is not configured, this
             # was hopefully intended by the user.
             return
 
-        self.m_wl_checker.check(pkg)
+        parser = Whitelisting.WhitelistParser(whitelist_path)
+        whitelist_entries = parser.parse(pkg.name)
+        wl_checker = Whitelisting.WhitelistChecker(
+            whitelist_entries,
+            restricted_paths=(
+                "/etc/cron.d/", "/etc/cron.hourly/", "/etc/cron.daily/",
+                "/etc/cron.weekly/", "/etc/cron.monthly/"
+            ),
+            error_map={
+                "unauthorized": "cronjob-unauthorized-file",
+                "changed": "cronjob-changed-file",
+                "ghost": "cronjob-ghost-file"
+            }
+        )
+        wl_checker.check(pkg)
 
 
 # needs to be instantiated for the check to be registered with rpmlint
